@@ -25,6 +25,12 @@ from rich.table import Table
 
 from mirrorcowork.bridge.mirrorbrain import MirrorBrainBridge, create_context_provider
 from mirrorcowork.events.watcher import EventCoordinator
+from mirrorcowork.mcp.hypervisor import (
+    AccessRequest,
+    MainMcpHypervisor,
+    config_path as mcp_config_path,
+    load_or_create_config,
+)
 from mirrorcowork.router.reflection import ReflectionRouter
 from mirrorcowork.router.sovereign import SovereignRouter
 from mirrorcowork.sovereignty.conscience import Conscience
@@ -68,6 +74,16 @@ def get_router(state_dir: Path | None = None) -> ReflectionRouter:
         AgentCapability.GIT_COMMIT,
         AgentCapability.SHELL_EXEC,
         AgentCapability.WEB_FETCH,
+    ])
+    router.register_agent("codex", [
+        AgentCapability.CODE_WRITE,
+        AgentCapability.CODE_READ,
+        AgentCapability.FILE_WRITE,
+        AgentCapability.FILE_READ,
+        AgentCapability.GIT_COMMIT,
+        AgentCapability.SHELL_EXEC,
+        AgentCapability.WEB_FETCH,
+        AgentCapability.MCP_CALL,
     ])
     router.register_agent("claude_desktop", [
         AgentCapability.CODE_READ,
@@ -301,6 +317,106 @@ def export(
         console.print(f"[green]State exported to {output}[/green]")
     else:
         console.print(output_json)
+
+
+# === MAIN MCP HYPERVISOR COMMANDS ===
+mcp_app = typer.Typer(help="Main MCP hypervisor (nested servers + firewall policy)")
+app.add_typer(mcp_app, name="mcp")
+
+
+@mcp_app.command("init")
+def mcp_init(
+    state_dir: Annotated[Optional[Path], typer.Option("--state-dir", help="State directory")] = None,
+    force_reset: Annotated[bool, typer.Option("--force-reset", help="Overwrite with defaults")] = False,
+):
+    """Create (or load) the Main MCP hypervisor config."""
+    sd = state_dir or DEFAULT_STATE_DIR
+    path = mcp_config_path(sd)
+    existed = path.exists()
+    load_or_create_config(path, force_reset=force_reset)
+    status = "reset" if force_reset and existed else "created" if not existed else "loaded"
+    console.print(f"[green]Main MCP config {status}:[/green] {path}")
+
+
+@mcp_app.command("list")
+def mcp_list(
+    state_dir: Annotated[Optional[Path], typer.Option("--state-dir", help="State directory")] = None,
+):
+    """List nested MCP servers and key policy controls."""
+    sd = state_dir or DEFAULT_STATE_DIR
+    cfg = load_or_create_config(mcp_config_path(sd))
+
+    table = Table(title="Nested MCP Servers")
+    table.add_column("Server")
+    table.add_column("Enabled", justify="center")
+    table.add_column("Tier")
+    table.add_column("Local")
+    table.add_column("Clients")
+    table.add_column("Capabilities")
+
+    for server in sorted(cfg.servers.values(), key=lambda s: s.id):
+        caps = ",".join(cap.value for cap in server.allow_capabilities) or "*"
+        clients = ",".join(server.allow_clients) or "*"
+        table.add_row(
+            server.id,
+            "yes" if server.enabled else "no",
+            server.tier,
+            "yes" if server.local_only else "no",
+            clients,
+            caps,
+        )
+
+    console.print(table)
+    console.print(
+        f"[dim]Policy: default_deny={cfg.default_deny}, kill_switch={cfg.kill_switch}, "
+        f"agents={len(cfg.agent_capability_matrix)}[/dim]"
+    )
+
+
+@mcp_app.command("check")
+def mcp_check(
+    agent: Annotated[str, typer.Argument(help="Requesting agent id")],
+    server_id: Annotated[str, typer.Argument(help="Nested server id")],
+    capability: Annotated[str, typer.Argument(help="Capability enum value (e.g. mcp_call)")],
+    tool: Annotated[Optional[str], typer.Option("--tool", help="Tool name")] = None,
+    uri: Annotated[Optional[str], typer.Option("--uri", help="Target URI for network checks")] = None,
+    skill: Annotated[Optional[str], typer.Option("--skill", help="Skill name")] = None,
+    state_dir: Annotated[Optional[Path], typer.Option("--state-dir", help="State directory")] = None,
+):
+    """Run a firewall/capability check through the Main MCP hypervisor."""
+    sd = state_dir or DEFAULT_STATE_DIR
+    cfg = load_or_create_config(mcp_config_path(sd))
+    hv = MainMcpHypervisor(cfg)
+
+    try:
+        cap = AgentCapability(capability)
+    except ValueError:
+        console.print(f"[red]Invalid capability:[/red] {capability}")
+        console.print("Valid: " + ", ".join(c.value for c in AgentCapability))
+        raise typer.Exit(1)
+
+    req = AccessRequest(
+        agent=agent,
+        server_id=server_id,
+        capability=cap,
+        tool=tool,
+        uri=uri,
+        skill=skill,
+    )
+    decision = hv.check(req)
+
+    color = "green" if decision.allowed else "red"
+    console.print(
+        Panel(
+            f"[bold]Allowed:[/bold] [{color}]{decision.allowed}[/{color}]\n"
+            f"[bold]Reason:[/bold] {decision.reason}\n"
+            f"[bold]Rules:[/bold] {', '.join(decision.matched_rules) if decision.matched_rules else '(none)'}",
+            title="Main MCP Decision",
+            border_style=color,
+        )
+    )
+    if not decision.allowed:
+        raise typer.Exit(2)
 
 
 # === SOVEREIGN COMMANDS ===
